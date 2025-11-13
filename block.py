@@ -2,8 +2,9 @@ import hashlib
 import json
 import time
 import os
-from urllib.parse import urlparse
 import requests
+from urllib.parse import urlparse
+from utils import Wallet # 导入 Wallet 工具
 
 class Blockchain:
     def __init__(self, port):
@@ -13,7 +14,6 @@ class Blockchain:
         self.port = port
         self.data_file = f"data/chain_{port}.json"
 
-        # 初始化时尝试从本地加载，如果没有则创建创世区块
         if not self.load_chain():
             self.create_genesis_block()
 
@@ -33,7 +33,6 @@ class Blockchain:
     @staticmethod
     def hash(block):
         """对区块进行 SHA-256 哈希计算"""
-        # 必须确保字典有序，否则哈希值会不一致
         block_string = json.dumps(block, sort_keys=True).encode()
         return hashlib.sha256(block_string).hexdigest()
 
@@ -41,17 +40,47 @@ class Blockchain:
     def last_block(self):
         return self.chain[-1]
 
-    def add_transaction(self, sender, receiver, amount):
-        """向交易池添加一笔新交易"""
-        self.pending_transactions.append({
-            'sender': sender,
+    def verify_transaction(self, transaction):
+        """
+        验证一个交易的签名是否有效
+        """
+        if transaction['sender'] == "0":
+            # 挖矿奖励交易没有签名
+            return True
+            
+        # 准备用于验证的数据 (不包含签名字段本身)
+        data_to_verify = {
+            'sender': transaction['sender'],
+            'receiver': transaction['receiver'],
+            'amount': transaction['amount']
+        }
+        
+        return Wallet.verify(
+            public_key_hex=transaction['sender'],
+            signature_hex=transaction['signature'],
+            data=data_to_verify
+        )
+
+    def add_transaction(self, sender_public_key, receiver, amount, signature):
+        """
+        向交易池添加一笔新交易 (并验证)
+        """
+        transaction = {
+            'sender': sender_public_key,
             'receiver': receiver,
-            'amount': amount
-        })
+            'amount': amount,
+            'signature': signature
+        }
+
+        if not self.verify_transaction(transaction):
+            print("警告: 收到无效的交易签名，已丢弃。")
+            return False
+
+        self.pending_transactions.append(transaction)
         return self.last_block['index'] + 1
 
     def proof_of_work(self, last_proof):
-        """简单的工作量证明算法：寻找一个数 p' 使得 hash(pp') 以 4 个零开头"""
+        """简单的工作量证明算法"""
         proof = 0
         while self.valid_proof(last_proof, proof) is False:
             proof += 1
@@ -59,17 +88,31 @@ class Blockchain:
 
     @staticmethod
     def valid_proof(last_proof, proof):
-        """验证证明: hash(last_proof, proof) 是否以 4 个零开头?"""
+        """验证证明"""
         guess = f'{last_proof}{proof}'.encode()
         guess_hash = hashlib.sha256(guess).hexdigest()
         return guess_hash[:4] == "0000"
 
-    def new_block(self, proof, previous_hash=None):
-        """创建一个新区块并添加到链中"""
+    def new_block(self, proof, previous_hash, miner_address):
+        """
+        创建一个新区块并添加到链中
+        :param miner_address: 挖矿奖励接收者的公钥 (或ID)
+        """
+        # 创建挖矿奖励交易 (发送者为 "0", 无需签名)
+        reward_tx = {
+            'sender': "0",
+            'receiver': miner_address,
+            'amount': 1, # 挖矿奖励为 1
+            'signature': None
+        }
+        
+        # 将奖励交易和待处理交易打包
+        transactions_for_block = [reward_tx] + self.pending_transactions
+
         block = {
             'index': len(self.chain),
             'timestamp': time.time(),
-            'transactions': self.pending_transactions,
+            'transactions': transactions_for_block,
             'proof': proof,
             'previous_hash': previous_hash or self.hash(self.chain[-1])
         }
@@ -86,32 +129,42 @@ class Blockchain:
         if parsed_url.netloc:
             self.nodes.add(parsed_url.netloc)
         elif parsed_url.path:
-             # 处理不带 http:// 前缀的情况
             self.nodes.add(parsed_url.path)
 
     def valid_chain(self, chain):
-        """检查给定的链是否有效"""
+        """
+        检查给定的链是否有效 (包括交易签名)
+        """
         last_block = chain[0]
         current_index = 1
 
         while current_index < len(chain):
             block = chain[current_index]
-            # 1. 检查区块的 previous_hash 是否正确
+            
+            # 1. 检查区块的 previous_hash
             if block['previous_hash'] != self.hash(last_block):
+                print(f"错误: Block {current_index} Previous Hash 不匹配.")
                 return False
-            # 2. 检查工作量证明是否正确
+                
+            # 2. 检查工作量证明
             if not self.valid_proof(last_block['proof'], block['proof']):
+                print(f"错误: Block {current_index} PoW 无效.")
                 return False
+                
+            # 3. 检查区块内的所有交易签名
+            for tx in block['transactions']:
+                if not self.verify_transaction(tx):
+                    print(f"错误: Block {current_index} 包含无效的交易签名.")
+                    return False
 
             last_block = block
             current_index += 1
         return True
 
     def resolve_conflicts(self):
-        """共识算法：解决冲突，使用网络中最长的链替换掉我们的链"""
+        """共识算法：解决冲突，使用网络中最长的有效链替换掉我们的链"""
         neighbours = self.nodes
         new_chain = None
-        # 我们只寻找比我们当前链更长的链
         max_length = len(self.chain)
 
         for node in neighbours:
@@ -121,15 +174,12 @@ class Blockchain:
                     length = response.json()['length']
                     chain = response.json()['chain']
 
-                    # 如果发现更长且有效的链，则记录下来
                     if length > max_length and self.valid_chain(chain):
                         max_length = length
                         new_chain = chain
             except requests.exceptions.RequestException:
-                 # 忽略无法连接的节点
                 continue
 
-        # 如果找到了更长且有效的链，替换掉我们本地的链
         if new_chain:
             self.chain = new_chain
             self.save_chain()
@@ -137,14 +187,12 @@ class Blockchain:
         return False
 
     def save_chain(self):
-        """将当前区块链数据保存到本地 JSON 文件"""
         if not os.path.exists('data'):
             os.makedirs('data')
         with open(self.data_file, 'w') as f:
             json.dump(self.chain, f, indent=4)
 
     def load_chain(self):
-        """尝试从本地 JSON 文件加载区块链数据"""
         if os.path.exists(self.data_file):
             with open(self.data_file, 'r') as f:
                 try:
