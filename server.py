@@ -1,42 +1,71 @@
 from flask import Flask, jsonify, request
 from uuid import uuid4
 from blockchain import Blockchain
+from utils import Wallet # 导入 Wallet 工具
 import sys
+import requests
 
-# 实例化节点
 app = Flask(__name__)
 
-# 为该节点生成一个全局唯一的地址
+# 为该节点生成一个全局唯一的地址 (用于挖矿奖励)
 node_identifier = str(uuid4()).replace('-', '')
 
-# 从命令行参数获取端口号，默认为 5000
 port = 5000
 if len(sys.argv) > 1:
     port = int(sys.argv[1])
 
-# 实例化区块链
 blockchain = Blockchain(port)
+
+
+# --- 钱包 API (用于演示) ---
+# 警告: 在真实应用中，私钥永远不应该通过 API 传输!
+# 这只是为了方便本教程的演示。
+
+@app.route('/wallet/new', methods=['GET'])
+def new_wallet():
+    """生成一个新钱包 (密钥对)"""
+    private_key, public_key = Wallet.generate_key_pair()
+    response = {
+        'message': "已创建新钱包",
+        'private_key': private_key,
+        'public_key': public_key
+    }
+    return jsonify(response), 200
+
+@app.route('/wallet/sign', methods=['POST'])
+def sign_data():
+    """(演示用) 传入私钥和数据以获取签名"""
+    values = request.get_json()
+    required = ['private_key', 'data']
+    if not all(k in values for k in required):
+        return '缺少参数 (private_key, data)', 400
+
+    private_key = values['private_key']
+    data_to_sign = values['data'] # data 应该是一个 dict
+    
+    signature = Wallet.sign(private_key, data_to_sign)
+    
+    if signature:
+        return jsonify({'signature': signature}), 200
+    else:
+        return '签名失败', 500
+
+
+# --- 核心区块链 API ---
 
 @app.route('/mine', methods=['GET'])
 def mine():
-    # 1. 运行工作量证明算法以获得下一个证明
     last_block = blockchain.last_block
     last_proof = last_block['proof']
     proof = blockchain.proof_of_work(last_proof)
 
-    # 2. 给矿工发放奖励 (sender 为 "0" 表示这是新挖出的币)
-    blockchain.add_transaction(
-        sender="0",
-        receiver=node_identifier,
-        amount=1,
-    )
-
-    # 3. 构造新区块并将其添加到链中
     previous_hash = blockchain.hash(last_block)
-    block = blockchain.new_block(proof, previous_hash)
+    
+    # 将 node_identifier (节点ID) 作为挖矿奖励的接收者
+    block = blockchain.new_block(proof, previous_hash, node_identifier)
 
     response = {
-        'message': "New Block Forged",
+        'message': "新区块已挖出",
         'index': block['index'],
         'transactions': block['transactions'],
         'proof': block['proof'],
@@ -47,15 +76,26 @@ def mine():
 @app.route('/transactions/new', methods=['POST'])
 def new_transaction():
     values = request.get_json()
-    # 检查 POST 数据中是否包含所需字段
-    required = ['sender', 'receiver', 'amount']
+    
+    # 检查 POST 数据中是否包含所需字段 (现在包括签名)
+    required = ['sender_public_key', 'receiver', 'amount', 'signature']
     if not all(k in values for k in required):
-        return 'Missing values', 400
+        return '缺少参数 (sender_public_key, receiver, amount, signature)', 400
 
-    # 创建新交易
-    index = blockchain.add_transaction(values['sender'], values['receiver'], values['amount'])
-    response = {'message': f'Transaction will be added to Block {index}'}
-    return jsonify(response), 201
+    # 创建新交易 (将由 blockchain.add_transaction 验证签名)
+    success = blockchain.add_transaction(
+        sender_public_key=values['sender_public_key'],
+        receiver=values['receiver'],
+        amount=values['amount'],
+        signature=values['signature']
+    )
+    
+    if success:
+        index = blockchain.last_block['index'] + 1
+        response = {'message': f'交易将进入区块 {index}'}
+        return jsonify(response), 201
+    else:
+        return '交易签名无效', 400
 
 @app.route('/chain', methods=['GET'])
 def full_chain():
@@ -65,37 +105,50 @@ def full_chain():
     }
     return jsonify(response), 200
 
+
+# --- P2P 节点 API (Gossip) ---
+
 @app.route('/nodes/register', methods=['POST'])
 def register_nodes():
+    """
+    注册新节点，并执行 'Gossip' 协议返回所有已知节点
+    """
     values = request.get_json()
     nodes = values.get('nodes')
     if nodes is None:
-        return "Error: Please supply a valid list of nodes", 400
+        return "错误: 请提供一个有效的节点列表", 400
 
-    for node in nodes:
-        blockchain.register_node(node)
-
+    new_nodes_discovered = set()
+    for node_url in nodes:
+        blockchain.register_node(node_url)
+        new_nodes_discovered.add(node_url.replace("http://", ""))
+    
+    # Gossip 协议: 返回我们所知道的所有节点
+    # 这样新节点就可以发现网络中的其他节点
+    all_known_nodes = list(blockchain.nodes)
+    
     response = {
-        'message': 'New nodes have been added',
-        'total_nodes': list(blockchain.nodes),
+        'message': '新节点已添加，并返回了网络中的所有已知节点',
+        'nodes_added': list(new_nodes_discovered),
+        'total_nodes_known': all_known_nodes
     }
     return jsonify(response), 201
 
 @app.route('/nodes/resolve', methods=['GET'])
 def consensus():
+    """共识算法，解决冲突"""
     replaced = blockchain.resolve_conflicts()
     if replaced:
         response = {
-            'message': 'Our chain was replaced',
+            'message': '我们的链已被替换为更长的有效链',
             'new_chain': blockchain.chain
         }
     else:
         response = {
-            'message': 'Our chain is authoritative',
+            'message': '我们的链是权威链',
             'chain': blockchain.chain
         }
     return jsonify(response), 200
 
 if __name__ == '__main__':
-    # 监听所有公开 IP，便于局域网内测试
     app.run(host='0.0.0.0', port=port)
